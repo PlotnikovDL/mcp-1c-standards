@@ -1,0 +1,22 @@
+# Generated caches and local artifacts
+.cache/
+cache/
+tmp/
+temp/
+
+# Python/tooling artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

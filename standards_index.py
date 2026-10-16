@@ -66,6 +66,14 @@ class StandardChunk:
     text: str
 
 
+@dataclass(frozen=True)
+class _CorpusSnapshot:
+    root: str
+    # Exact alias/target strings also detect case-only renames on Windows.
+    # Metadata only: size and mtime_ns, not content hashes, inode or ctime.
+    files: tuple[tuple[str, str, int, int], ...]
+
+
 class StandardsIndex:
     def __init__(
         self,
@@ -82,6 +90,11 @@ class StandardsIndex:
         self.query_instruction = query_instruction
         self._chunks: list[StandardChunk] | None = None
         self._embeddings: np.ndarray | None = None
+        self._snapshot: _CorpusSnapshot | None = None
+        self._chunk_manifest: dict[str, Any] | None = None
+        # V1 does not record resolved targets. After an observed change, do not
+        # trust disk again until this instance persists a verified new snapshot.
+        self._bypass_disk_cache = False
         self._embedding_model: SentenceTransformer | None = None
         self._reranker_model: CrossEncoder | None = None
 
@@ -141,11 +154,16 @@ class StandardsIndex:
             mode_config["use_reranker"] if use_reranker is None else bool(use_reranker)
         )
         resolved_candidate_limit = max(limit, min(resolved_candidate_limit, 100))
+        # Only the query boundary may refresh. Helpers verify this snapshot;
+        # they must not swap datasets underneath local chunks/candidate indexes.
+        snapshot = self._refresh_snapshot()
         chunks = self._ensure_chunks()
         if not chunks:
+            self._verify_snapshot(snapshot)
             return {"query": query, "results": []}
 
         candidate_indexes, embedding_scores = self._semantic_candidates(query, resolved_candidate_limit)
+        self._verify_snapshot(snapshot)
         ranked = self._rerank(query, candidate_indexes) if resolved_use_reranker else []
 
         if ranked:
@@ -172,6 +190,7 @@ class StandardsIndex:
                 }
             )
 
+        self._verify_snapshot(snapshot)
         return {
             "query": query,
             "mode": mode,
@@ -191,7 +210,9 @@ class StandardsIndex:
 
     def _semantic_candidates(self, query: str, candidate_limit: int) -> tuple[np.ndarray, np.ndarray]:
         embeddings = self._ensure_embeddings()
+        snapshot = self._snapshot
         query_embedding = self._embed_query(query)
+        self._verify_snapshot(snapshot)
         scores = embeddings @ query_embedding
         candidate_indexes = np.argsort(scores)[::-1][:candidate_limit]
         return candidate_indexes, scores
@@ -201,6 +222,7 @@ class StandardsIndex:
             return []
 
         chunks = self._ensure_chunks()
+        snapshot = self._snapshot
         pairs = [(query, self._reranker_text(chunks[int(index)])) for index in candidate_indexes]
         with quiet_model_output():
             try:
@@ -208,6 +230,7 @@ class StandardsIndex:
             except TypeError:
                 scores = self._get_reranker_model().predict(pairs)
 
+        self._verify_snapshot(snapshot)
         ranked = [
             {"index": int(index), "rerank_score": float(score)}
             for index, score in zip(candidate_indexes, scores, strict=False)
@@ -215,28 +238,79 @@ class StandardsIndex:
         ranked.sort(key=lambda item: item["rerank_score"], reverse=True)
         return ranked
 
+    def _capture_snapshot(self, *, require_directory: bool = True) -> _CorpusSnapshot:
+        if require_directory and not self.standards_dir.is_dir():
+            raise FileNotFoundError(f"Standards directory not found: {self.standards_dir}")
+        root = str(self.standards_dir.resolve())
+        files = []
+        for path, resolved in self._discover_standard_paths():
+            stat = resolved.stat()
+            files.append((str(path), str(resolved), stat.st_size, stat.st_mtime_ns))
+        return _CorpusSnapshot(root, tuple(files))
+
+    def _invalidate_index(self) -> None:
+        # Loaded model objects are independent of the corpus and stay resident.
+        self._chunks = None
+        self._embeddings = None
+        self._snapshot = None
+        self._chunk_manifest = None
+        self._bypass_disk_cache = True
+
+    def _refresh_snapshot(self) -> _CorpusSnapshot:
+        try:
+            snapshot = self._capture_snapshot()
+        except (OSError, ValueError):
+            self._invalidate_index()
+            raise
+        if self._snapshot is not None and self._snapshot != snapshot:
+            self._invalidate_index()
+        self._snapshot = snapshot
+        return snapshot
+
+    def _verify_snapshot(self, expected: _CorpusSnapshot | None) -> None:
+        try:
+            observed = self._capture_snapshot()
+        except (OSError, ValueError):
+            self._invalidate_index()
+            raise  # Invalid corpus errors are not cache misses.
+        if expected is None or self._snapshot != expected or observed != expected:
+            self._invalidate_index()
+            raise RuntimeError("Standards corpus changed during search; please repeat the search.")
+
     def _ensure_chunks(self) -> list[StandardChunk]:
+        snapshot = self._snapshot
+        if snapshot is None:
+            snapshot = self._refresh_snapshot()
+        self._verify_snapshot(snapshot)
         if self._chunks is not None:
             return self._chunks
 
-        if not self.standards_dir.exists():
-            raise FileNotFoundError(f"Standards directory not found: {self.standards_dir}")
-
         chunks: list[StandardChunk] = []
-        for path, resolved in self._discover_standard_paths():
-            content = resolved.read_text(encoding="utf-8-sig", errors="replace")
-            title = self._extract_title(content)
-            chunks.extend(self._split_document(path, title, content))
-
+        try:
+            for path, resolved, _, _ in snapshot.files:
+                content = Path(resolved).read_text(encoding="utf-8-sig", errors="replace")
+                title = self._extract_title(content)
+                chunks.extend(self._split_document(Path(path), title, content))
+        except (OSError, ValueError):
+            self._invalidate_index()
+            raise
+        self._verify_snapshot(snapshot)
+        # Capture V1 metadata for exactly these chunks, before any encoding.
+        self._chunk_manifest = self._cache_manifest(chunks, snapshot)
         self._chunks = chunks
         return chunks
 
     def _ensure_embeddings(self) -> np.ndarray:
+        chunks = self._ensure_chunks()
+        snapshot = self._snapshot
         if self._embeddings is not None:
             return self._embeddings
 
-        chunks = self._ensure_chunks()
-        cached_embeddings = self._load_cached_embeddings(chunks)
+        manifest = self._chunk_manifest
+        cached_embeddings = (
+            None if self._bypass_disk_cache else self._load_cached_embeddings(chunks, manifest)
+        )
+        self._verify_snapshot(snapshot)
         if cached_embeddings is not None:
             self._embeddings = cached_embeddings
             return self._embeddings
@@ -250,11 +324,17 @@ class StandardsIndex:
                 normalize_embeddings=True,
                 show_progress_bar=False,
             )
-        self._embeddings = np.asarray(matrix, dtype=np.float32)
-        self._save_cached_embeddings(chunks, self._embeddings)
+        matrix = np.asarray(matrix, dtype=np.float32)
+        self._verify_snapshot(snapshot)
+        self._save_cached_embeddings(manifest, matrix, snapshot)
+        self._verify_snapshot(snapshot)
+        self._bypass_disk_cache = False
+        self._embeddings = matrix
         return self._embeddings
 
-    def _load_cached_embeddings(self, chunks: list[StandardChunk]) -> np.ndarray | None:
+    def _load_cached_embeddings(
+        self, chunks: list[StandardChunk], expected: dict[str, Any] | None = None,
+    ) -> np.ndarray | None:
         manifest_path = self.cache_dir / "manifest.json"
         embeddings_path = self.cache_dir / "embeddings.npy"
         if not manifest_path.exists() or not embeddings_path.exists():
@@ -265,7 +345,9 @@ class StandardsIndex:
         except (OSError, ValueError):
             return None
 
-        expected = self._cache_manifest(chunks)
+        if expected is None:
+            # Preserve live validation for direct cache-reader callers.
+            expected = self._cache_manifest(chunks)
         if manifest != expected:
             return None
 
@@ -290,33 +372,35 @@ class StandardsIndex:
                 return None
         return embeddings
 
-    def _save_cached_embeddings(self, chunks: list[StandardChunk], embeddings: np.ndarray) -> None:
+    def _save_cached_embeddings(
+        self, manifest: dict[str, Any], embeddings: np.ndarray, snapshot: _CorpusSnapshot,
+    ) -> None:
+        self._verify_snapshot(snapshot)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # The existing two-file write is not atomic. Even if the corpus changes
+        # during it, old vectors must retain their captured old-data manifest.
         np.save(self.cache_dir / "embeddings.npy", embeddings)
         (self.cache_dir / "manifest.json").write_text(
-            json.dumps(self._cache_manifest(chunks), ensure_ascii=False, indent=2),
+            json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        self._verify_snapshot(snapshot)
 
-    def _cache_manifest(self, chunks: list[StandardChunk]) -> dict[str, Any]:
-        files = []
-        for path, resolved in self._discover_standard_paths():
-            stat = resolved.stat()
-            files.append(
-                {
-                    "file": path.name,
-                    "size": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
-                }
-            )
-
+    def _cache_manifest(
+        self, chunks: list[StandardChunk], snapshot: _CorpusSnapshot | None = None,
+    ) -> dict[str, Any]:
+        if snapshot is None:
+            snapshot = self._capture_snapshot(require_directory=False)
         return {
             "version": 1,
-            "standards_dir": str(self.standards_dir.resolve()),
+            "standards_dir": str(snapshot.root),
             "embedding_model": self.embedding_model_name,
             "query_instruction": self.query_instruction,
             "chunk_count": len(chunks),
-            "files": files,
+            "files": [
+                {"file": Path(path).name, "size": size, "mtime_ns": mtime_ns}
+                for path, _, size, mtime_ns in snapshot.files
+            ],
         }
 
     def _embed_query(self, query: str) -> np.ndarray:

@@ -18,10 +18,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HEAVY_MODULES = {"sentence_transformers", "torch", "transformers", "huggingface_hub"}
 CORE_FILES = ("server.py", "standards_index.py", "requirements.txt")
-EXPECTED_DEFECT_ERRORS = dict.fromkeys((
-    "test_known_defect_warm_index_does_not_refresh_changed_source",
-    "test_known_defect_source_mutation_during_encode_stamps_stale_vectors_current",
-), "AssertionError")
+EXPECTED_DEFECT_ERRORS = {
+    "test_known_limitation_same_size_mtime_content_change_is_not_detected": "AssertionError",
+}
 
 
 class BlockedOperation(RuntimeError):

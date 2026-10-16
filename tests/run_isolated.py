@@ -27,8 +27,6 @@ EXPECTED_DEFECT_ERRORS = {
         "test_known_defect_source_mutation_during_encode_stamps_stale_vectors_current",
         "test_known_defect_rank_one_cache_is_accepted",
         "test_known_defect_nonfinite_cache_is_accepted",
-        "test_known_defect_list_exposes_symlink_outside_corpus",
-        "test_known_defect_search_indexes_symlink_outside_corpus",
     ), "AssertionError"),
 }
 

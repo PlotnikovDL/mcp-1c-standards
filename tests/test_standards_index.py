@@ -86,13 +86,12 @@ class IndexFixture(unittest.TestCase):
         self.alpha.write_text("# Alpha\nbeta changed synthetic body with new length\n", encoding="utf-8")
         os.utime(self.alpha, ns=(old.st_atime_ns, old.st_mtime_ns + 2_000_000_000))
 
-    def external_symlink(self):
-        # Both link and target stay in this fixture/shared test root.
-        target = self.root / "outside.md"
-        target.write_text("# Outside\nsynthetic outside-root marker\n", encoding="utf-8")
-        link = self.corpus / "outside-link.md"
+    def synthetic_symlink(self, link, target, *, target_is_directory=False):
+        # Even outside-corpus and broken targets stay within the broad fixture root.
+        self.assertTrue(link.is_relative_to(self.root))
+        self.assertTrue(target.is_relative_to(self.root))
         try:
-            link.symlink_to(target)
+            link.symlink_to(target, target_is_directory=target_is_directory)
         except NotImplementedError as error:
             self.skipTest(f"Synthetic symlinks unsupported: {error}")
         except OSError as error:
@@ -101,8 +100,21 @@ class IndexFixture(unittest.TestCase):
             raise
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.resolve(), target.resolve())
+        return link
+
+    def external_symlink(self):
+        target = self.root / "outside.md"
+        target.write_text("# Outside\nsynthetic outside-root marker\n", encoding="utf-8")
+        link = self.synthetic_symlink(self.corpus / "outside-link.md", target)
         self.assertNotIn(self.corpus.resolve(), target.resolve().parents)
         return link
+
+    def assert_no_model_or_cache_work(self, index):
+        self.assertEqual(index._embedding_model.calls, [])
+        self.assertEqual(index._reranker_model.calls, [])
+        self.assertEqual(list(self.cache.iterdir()), [])
+        self.assertIsNone(index._chunks)
+        self.assertIsNone(index._embeddings)
 
 
 class ReadListTests(IndexFixture):
@@ -145,14 +157,20 @@ class ReadListTests(IndexFixture):
             with self.subTest(path=value), self.assertRaises(FileNotFoundError):
                 self.index.read_standard(value)
         (self.corpus / "directory.md").mkdir()
-        # Windows reports PermissionError; POSIX reports IsADirectoryError.
-        with self.assertRaises((PermissionError, IsADirectoryError)):
+        with self.assertRaises(FileNotFoundError):
             self.index.read_standard("directory.md")
 
     def test_read_rejects_outside_symlink(self):
         link = self.external_symlink()
         with self.assertRaisesRegex(ValueError, "outside standards"):
             self.index.read_standard(link.name)
+
+    def test_list_rejects_outside_symlink(self):
+        self.external_symlink()
+        with patch.object(Path, "read_text", side_effect=AssertionError("Read before validation")):
+            with self.assertRaisesRegex(ValueError, "outside standards"):
+                self.index.list_standards()
+        self.assert_no_model_or_cache_work(self.index)
 
     def test_from_env_uses_only_explicit_fixture_paths(self):
         env = {"ONEC_STANDARDS_DIR": str(self.corpus),
@@ -172,6 +190,13 @@ class ReadListTests(IndexFixture):
 
 
 class SearchTests(IndexFixture):
+    def test_search_rejects_outside_symlink(self):
+        self.external_symlink()
+        with patch.object(Path, "read_text", side_effect=AssertionError("Read before validation")):
+            with self.assertRaisesRegex(ValueError, "outside standards"):
+                self.index.search("alpha", limit=20, mode="fast")
+        self.assert_no_model_or_cache_work(self.index)
+
     def test_empty_query_short_circuits_even_invalid_options(self):
         self.assertEqual(self.index.search(" \n\t", limit="invalid", mode="unknown",
                                            candidate_limit="invalid"),
@@ -185,8 +210,11 @@ class SearchTests(IndexFixture):
         index = self.make_index(standards_dir=empty)
         self.assertEqual(index.search(" alpha "), {"query": "alpha", "results": []})
         self.assertEqual(index.list_standards(), [])
+        self.assertEqual(index._cache_manifest([])["files"], [])
         self.assertEqual(index._embedding_model.calls, [])
         missing = self.make_index(standards_dir=self.root / "missing")
+        self.assertEqual(missing.list_standards(), [])
+        self.assertEqual(missing._cache_manifest([])["files"], [])
         with self.assertRaises(FileNotFoundError):
             missing.search("alpha")
 
@@ -246,6 +274,133 @@ class SearchTests(IndexFixture):
                 result = self.index.search("alpha", limit=limit, mode="fast", candidate_limit=candidate)
                 self.assertEqual(len(result["results"]), expected_limit)
                 self.assertEqual(result["candidate_limit"], expected_candidates)
+
+
+class DiscoveryBoundaryTests(IndexFixture):
+    def assert_invalid_entry_rejected(self, entry, error_type):
+        operations = {
+            "read": lambda index: index.read_standard(entry.name),
+            "list": lambda index: index.list_standards(),
+            "chunks": lambda index: index._ensure_chunks(),
+            "search_fast": lambda index: index.search("alpha", mode="fast"),
+            "search_normal": lambda index: index.search("alpha", mode="normal"),
+            "embeddings": lambda index: index._ensure_embeddings(),
+            "manifest": lambda index: index._cache_manifest([]),
+        }
+        for name, operation in operations.items():
+            with self.subTest(operation=name):
+                index = self.make_index()
+                with patch.object(Path, "read_text", side_effect=AssertionError("Read before validation")), \
+                        patch.object(index, "_load_cached_embeddings") as load, \
+                        patch.object(index, "_save_cached_embeddings") as save:
+                    with self.assertRaises(error_type):
+                        operation(index)
+                    load.assert_not_called()
+                    save.assert_not_called()
+                self.assert_no_model_or_cache_work(index)
+
+    def test_outside_symlink_rejected_before_content_models_or_cache(self):
+        self.assert_invalid_entry_rejected(self.external_symlink(), ValueError)
+
+    def test_nonfile_markdown_rejected_before_content_models_or_cache(self):
+        entry = self.corpus / "z-directory.md"
+        entry.mkdir()
+        self.assert_invalid_entry_rejected(entry, FileNotFoundError)
+
+    def test_broken_symlink_rejected_before_content_models_or_cache(self):
+        entry = self.synthetic_symlink(self.corpus / "z-broken.md", self.corpus / "missing.md")
+        self.assert_invalid_entry_rejected(entry, FileNotFoundError)
+
+    def test_wrong_extension_target_rejected_before_content_models_or_cache(self):
+        target = self.corpus / "target.txt"
+        target.write_text("# Not Markdown", encoding="utf-8")
+        entry = self.synthetic_symlink(self.corpus / "z-wrong-extension.md", target)
+        self.assert_invalid_entry_rejected(entry, FileNotFoundError)
+
+    def test_directory_symlink_rejected_before_content_models_or_cache(self):
+        # Keep the target nested so only its alias participates in discovery.
+        nested = self.corpus / "nested"
+        nested.mkdir()
+        target = nested / "directory.md"
+        target.mkdir()
+        entry = self.synthetic_symlink(self.corpus / "z-directory-link.md", target,
+                                       target_is_directory=True)
+        self.assert_invalid_entry_rejected(entry, FileNotFoundError)
+
+    def test_internal_symlink_preserves_aliases_and_resolved_file_access(self):
+        nested = self.corpus / "nested"
+        nested.mkdir()
+        target = nested / "target.md"
+        content = "# Internal\nalpha internal body\n"
+        target.write_text(content, encoding="utf-8")
+        alias = self.synthetic_symlink(self.corpus / "z-alias.md", target)
+        read_paths = []
+        stat_paths = []
+        original_read = Path.read_text
+        original_stat = Path.stat
+
+        def read_resolved(path, *args, **kwargs):
+            self.assertNotEqual(path, alias)
+            self.assertTrue(path.is_absolute())
+            read_paths.append(path)
+            return original_read(path, *args, **kwargs)
+
+        def stat_resolved(path, *args, **kwargs):
+            self.assertNotEqual(path, alias)
+            stat_paths.append(path)
+            return original_stat(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=read_resolved), \
+                patch.object(Path, "stat", autospec=True, side_effect=stat_resolved):
+            rows = self.index.list_standards()
+            read = self.index.read_standard(alias.name)
+            result = self.index.search("alpha", mode="fast")
+            manifest = self.index._cache_manifest(self.index._chunks)
+
+        self.assertEqual(rows, [
+            {"file": "a.md", "path": str(self.alpha), "title": "Alpha"},
+            {"file": "b.md", "path": str(self.corpus / "b.md"), "title": "Beta"},
+            {"file": alias.name, "path": str(alias), "title": "Internal"},
+        ])
+        # read_standard retains its existing resolved-target identity.
+        self.assertEqual(read, dict(file=target.name, path=str(target.resolve()),
+                                    title="Internal", content=content))
+        self.assertEqual([(chunk.file_name, chunk.path) for chunk in self.index._chunks],
+                         [(row["file"], row["path"]) for row in rows])
+        alias_result = next(row for row in result["results"] if row["file"] == alias.name)
+        self.assertEqual(alias_result["path"], str(alias))
+        self.assertEqual(alias_result["excerpt"], "# Internal alpha internal body")
+        self.assertEqual(set(read_paths), {self.alpha.resolve(), (self.corpus / "b.md").resolve(),
+                                          target.resolve()})
+        self.assertIn(target.resolve(), stat_paths)
+        files = []
+        for path in (self.alpha, self.corpus / "b.md", alias):
+            stat = path.resolve().stat()
+            files.append(dict(file=path.name, size=stat.st_size, mtime_ns=stat.st_mtime_ns))
+        self.assertEqual(manifest, dict(version=1, standards_dir=str(self.corpus.resolve()),
+                                       embedding_model="fake-embedding", query_instruction="fixture instruction",
+                                       chunk_count=3, files=files))
+        self.assertEqual(json.loads((self.cache / "manifest.json").read_text(encoding="utf-8")), manifest)
+
+    def test_relative_corpus_preserves_paths_and_manifest(self):
+        previous = Path.cwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(self.root)
+        index = self.make_index(standards_dir=Path("corpus"))
+        rows = index.list_standards()
+        self.assertEqual(rows, [
+            {"file": "a.md", "path": str(Path("corpus") / "a.md"), "title": "Alpha"},
+            {"file": "b.md", "path": str(Path("corpus") / "b.md"), "title": "Beta"},
+        ])
+        self.assertEqual(index.read_standard("a.md"), self.index.read_standard("a.md"))
+        result = index.search("alpha", mode="fast")
+        self.assertEqual([(row["file"], row["path"]) for row in result["results"]],
+                         [(row["file"], row["path"]) for row in rows])
+        self.assertEqual([(chunk.file_name, chunk.path) for chunk in index._chunks],
+                         [(row["file"], row["path"]) for row in rows])
+        expected = self.index._cache_manifest(index._chunks)
+        self.assertEqual(index._cache_manifest(index._chunks), expected)
+        self.assertEqual(json.loads((self.cache / "manifest.json").read_text(encoding="utf-8")), expected)
 
 
 class CacheTests(IndexFixture):
@@ -371,21 +526,3 @@ class KnownDefectTests(IndexFixture):
         matrix = other._ensure_embeddings()
         self.assertTrue(np.isfinite(matrix).all())
         self.assertEqual(self.document_calls(other), 1)
-
-    @unittest.expectedFailure
-    def test_known_defect_list_exposes_symlink_outside_corpus(self):
-        link = self.external_symlink()
-        try:
-            rows = self.index.list_standards()
-        except ValueError:
-            return  # Rejecting the escaped path is also a safe outcome.
-        self.assertNotIn(link.name, [row["file"] for row in rows])
-
-    @unittest.expectedFailure
-    def test_known_defect_search_indexes_symlink_outside_corpus(self):
-        link = self.external_symlink()
-        try:
-            result = self.index.search("alpha", limit=20, mode="fast")
-        except ValueError:
-            return  # Rejecting the escaped path is also a safe outcome.
-        self.assertNotIn(link.name, [row["file"] for row in result["results"]])

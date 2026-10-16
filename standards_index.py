@@ -104,9 +104,9 @@ class StandardsIndex:
             {
                 "file": path.name,
                 "path": str(path),
-                "title": self._extract_title(path.read_text(encoding="utf-8-sig", errors="replace")),
+                "title": self._extract_title(resolved.read_text(encoding="utf-8-sig", errors="replace")),
             }
-            for path in sorted(self.standards_dir.glob("*.md"))
+            for path, resolved in self._discover_standard_paths()
         ]
 
     def read_standard(self, standard_path: str) -> dict[str, str]:
@@ -222,8 +222,8 @@ class StandardsIndex:
             raise FileNotFoundError(f"Standards directory not found: {self.standards_dir}")
 
         chunks: list[StandardChunk] = []
-        for path in sorted(self.standards_dir.glob("*.md")):
-            content = path.read_text(encoding="utf-8-sig", errors="replace")
+        for path, resolved in self._discover_standard_paths():
+            content = resolved.read_text(encoding="utf-8-sig", errors="replace")
             title = self._extract_title(content)
             chunks.extend(self._split_document(path, title, content))
 
@@ -288,8 +288,8 @@ class StandardsIndex:
 
     def _cache_manifest(self, chunks: list[StandardChunk]) -> dict[str, Any]:
         files = []
-        for path in sorted(self.standards_dir.glob("*.md")):
-            stat = path.stat()
+        for path, resolved in self._discover_standard_paths():
+            stat = resolved.stat()
             files.append(
                 {
                     "file": path.name,
@@ -347,6 +347,14 @@ class StandardsIndex:
     def _query_prompt(self) -> str:
         return f"Instruct: {self.query_instruction}\nQuery: "
 
+    def _discover_standard_paths(self) -> list[tuple[Path, Path]]:
+        # Validate the complete discovery before consuming content or building a manifest.
+        # Keep aliases for display; all file access uses the validated resolved path.
+        return [
+            (path, self._resolve_standard_path(str(path.absolute())))
+            for path in sorted(self.standards_dir.glob("*.md"))
+        ]
+
     def _resolve_standard_path(self, standard_path: str) -> Path:
         requested = Path(standard_path)
         path = requested if requested.is_absolute() else self.standards_dir / requested
@@ -355,7 +363,7 @@ class StandardsIndex:
 
         if standards_root not in resolved.parents and resolved != standards_root:
             raise ValueError(f"Path is outside standards directory: {standard_path}")
-        if not resolved.exists() or resolved.suffix.lower() != ".md":
+        if not resolved.is_file() or resolved.suffix.lower() != ".md":
             raise FileNotFoundError(f"Standard not found: {standard_path}")
 
         return resolved

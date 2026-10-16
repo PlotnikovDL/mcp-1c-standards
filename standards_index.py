@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from zipfile import BadZipFile
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -261,7 +262,7 @@ class StandardsIndex:
 
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             return None
 
         expected = self._cache_manifest(chunks)
@@ -269,14 +270,25 @@ class StandardsIndex:
             return None
 
         try:
-            embeddings = np.load(embeddings_path)
-        except OSError:
+            embeddings = np.load(embeddings_path, allow_pickle=False)
+        except (OSError, ValueError, EOFError, BadZipFile):
             return None
 
-        if embeddings.shape[0] != len(chunks):
+        if isinstance(embeddings, np.lib.npyio.NpzFile):
+            # Reject archives without reading or decompressing any members.
+            embeddings.close()
+            return None
+        if not isinstance(embeddings, np.ndarray):
+            return None
+        if (embeddings.ndim != 2 or embeddings.shape[0] != len(chunks)
+                or embeddings.shape[1] == 0 or embeddings.dtype.kind not in "iuf"):
             return None
 
-        return np.asarray(embeddings, dtype=np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            embeddings = np.asarray(embeddings, dtype=np.float32)
+            if not np.isfinite(embeddings).all():
+                return None
+        return embeddings
 
     def _save_cached_embeddings(self, chunks: list[StandardChunk], embeddings: np.ndarray) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)

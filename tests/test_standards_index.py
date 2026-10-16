@@ -11,6 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+from zipfile import ZipFile
 
 import numpy as np
 
@@ -75,7 +76,7 @@ class IndexFixture(unittest.TestCase):
         self.index.search("alpha", mode="fast")
         self.assertEqual(self.document_calls(self.index), 1)
         self.assertTrue((self.cache / "manifest.json").is_file())
-        self.assertEqual(np.load(self.cache / "embeddings.npy").shape, (2, 2))
+        self.assertEqual(np.load(self.cache / "embeddings.npy", allow_pickle=False).shape, (2, 2))
 
     @staticmethod
     def document_calls(index):
@@ -442,10 +443,18 @@ class CacheTests(IndexFixture):
                 other = self.make_index()
                 other.search("alpha", mode="fast")
                 self.assertEqual(self.document_calls(other), 1)
-        manifest_path.write_text("{invalid json", encoding="utf-8")
+        for payload in (b"{invalid json", b"\xff\xfe", b"null", b"[]"):
+            with self.subTest(manifest=payload):
+                manifest_path.write_bytes(payload)
+                other = self.make_index()
+                other.search("alpha", mode="fast")
+                self.assertEqual(self.document_calls(other), 1)
+        # JSON integer-digit limits can raise plain ValueError, not JSONDecodeError.
         other = self.make_index()
-        other.search("alpha", mode="fast")
+        with patch.object(json, "loads", side_effect=ValueError("fixture integer digit limit")):
+            matrix = other._ensure_embeddings()
         self.assertEqual(self.document_calls(other), 1)
+        self.assertEqual(matrix.tolist(), [[1.0, 0.0], [0.0, 1.0]])
 
     def test_wrong_row_count_and_missing_matrix_rebuild(self):
         self.seed_cache()
@@ -457,6 +466,213 @@ class CacheTests(IndexFixture):
         other = self.make_index()
         other.search("alpha", mode="fast")
         self.assertEqual(self.document_calls(other), 1)
+
+    def assert_cache_rebuilt(self):
+        other = self.make_index()
+        matrix = other._ensure_embeddings()
+        self.assertEqual(self.document_calls(other), 1)
+        self.assertEqual(matrix.dtype, np.dtype("float32"))
+        self.assertEqual(matrix.tolist(), [[1.0, 0.0], [0.0, 1.0]])
+        # Recovery must replace the bad on-disk cache, not just bypass it once.
+        reused = self.make_index()
+        self.assertEqual(reused._ensure_embeddings().tolist(), matrix.tolist())
+        self.assertEqual(self.document_calls(reused), 0)
+
+    def test_corrupt_npy_rebuilds(self):
+        self.seed_cache()
+        (self.cache / "embeddings.npy").write_bytes(b"not a numpy file")
+        self.assert_cache_rebuilt()
+
+    def test_empty_npy_rebuilds(self):
+        self.seed_cache()
+        (self.cache / "embeddings.npy").write_bytes(b"")
+        self.assert_cache_rebuilt()
+
+    def test_rank_one_cache_rebuilds(self):
+        self.seed_cache()
+        np.save(self.cache / "embeddings.npy", np.ones(2, dtype=np.float32))
+        self.assert_cache_rebuilt()
+
+    def test_rank_zero_cache_rebuilds(self):
+        self.seed_cache()
+        np.save(self.cache / "embeddings.npy", np.asarray(1.0, dtype=np.float32))
+        self.assert_cache_rebuilt()
+
+    def test_nonfinite_cache_rebuilds(self):
+        self.seed_cache()
+        for value in (np.nan, np.inf, -np.inf):
+            with self.subTest(value=value):
+                np.save(self.cache / "embeddings.npy",
+                        np.asarray([[value, 0.0], [0.0, 1.0]], dtype=np.float32))
+                self.assert_cache_rebuilt()
+
+    def test_signaling_nan_rebuilds_with_local_error_state(self):
+        self.seed_cache()
+        for integer_dtype, float_dtype, bits in (
+            (np.uint32, np.float32, 0x7F800001),
+            (np.uint64, np.float64, 0x7FF0000000000001),
+        ):
+            with self.subTest(dtype=float_dtype.__name__):
+                # Build IEEE signaling NaNs by viewing bits, with no float arithmetic.
+                source = np.asarray([[bits, 0], [0, 0]], dtype=integer_dtype).view(float_dtype)
+                np.save(self.cache / "embeddings.npy", source)
+                with np.errstate(invalid="raise"):
+                    before = np.geterr().copy()
+                    self.assert_cache_rebuilt()
+                    self.assertEqual(np.geterr(), before)
+
+    def test_empty_columns_and_higher_rank_rebuild(self):
+        self.seed_cache()
+        for shape in ((2, 0), (2, 2, 1), (0, 2)):
+            with self.subTest(shape=shape):
+                np.save(self.cache / "embeddings.npy", np.ones(shape, dtype=np.float32))
+                self.assert_cache_rebuilt()
+
+    def test_non_real_numeric_dtypes_rebuild(self):
+        self.seed_cache()
+        cases = {
+            "bool": np.ones((2, 2), dtype=np.bool_),
+            "complex": np.ones((2, 2), dtype=np.complex128),
+            # Only ordinary benign strings: no custom objects or reduce hooks.
+            "object": np.full((2, 2), "benign fixture", dtype=object),
+            "unicode": np.full((2, 2), "1.0", dtype="U3"),
+            "bytes": np.full((2, 2), b"1.0", dtype="S3"),
+            "structured": np.zeros((2, 2), dtype=[("value", "f4")]),
+            "void": np.zeros((2, 2), dtype="V4"),
+            "datetime": np.zeros((2, 2), dtype="datetime64[D]"),
+            "timedelta": np.zeros((2, 2), dtype="timedelta64[D]"),
+        }
+        for name, matrix in cases.items():
+            with self.subTest(dtype=name):
+                np.save(self.cache / "embeddings.npy", matrix)
+                self.assert_cache_rebuilt()
+
+    def test_real_numeric_dtypes_reuse_as_float32(self):
+        self.seed_cache()
+        for dtype in ("int8", "int64", "uint8", "uint64", "float16", "float32", "float64"):
+            with self.subTest(dtype=dtype):
+                # Three columns intentionally do not enforce the fake model's dimension.
+                source = np.asarray([[1, 2, 3], [4, 5, 6]], dtype=dtype)
+                np.save(self.cache / "embeddings.npy", source)
+                other = self.make_index()
+                matrix = other._ensure_embeddings()
+                self.assertEqual(matrix.dtype, np.dtype("float32"))
+                self.assertEqual(matrix.tolist(), source.tolist())
+                self.assertEqual(other._embedding_model.calls, [])
+
+    def test_finite_float32_overflow_rebuilds_with_local_error_state(self):
+        self.seed_cache()
+        for value in (np.finfo(np.float64).max, -np.finfo(np.float64).max):
+            with self.subTest(value=value):
+                source = np.asarray([[value, 0.0], [0.0, 1.0]], dtype=np.float64)
+                self.assertTrue(np.isfinite(source).all())
+                np.save(self.cache / "embeddings.npy", source)
+                with np.errstate(over="raise"):
+                    before = np.geterr().copy()
+                    self.assert_cache_rebuilt()
+                    self.assertEqual(np.geterr(), before)
+
+    def test_malformed_and_truncated_npy_and_archives_rebuild(self):
+        self.seed_cache()
+        path = self.cache / "embeddings.npy"
+        valid_npy = path.read_bytes()
+        with path.open("wb") as stream:
+            np.savez_compressed(stream, vectors=np.ones((2, 2), dtype=np.float32))
+        valid_zip = path.read_bytes()
+        cases = {
+            "npy_magic_only": valid_npy[:6],
+            "npy_partial_header": valid_npy[:12],
+            "npy_invalid_header": b"\x93NUMPY\x01\x00\x04\x00bad\n",
+            "npy_partial_data": valid_npy[:-1],
+            "zip_invalid_directory": b"PK\x03\x04broken fixture archive",
+            "zip_truncated_directory": valid_zip[:-12],
+        }
+        for name, payload in cases.items():
+            with self.subTest(payload=name):
+                path.write_bytes(payload)
+                self.assert_cache_rebuilt()
+
+    def test_npz_rejected_without_member_reads_and_resources_closed(self):
+        self.seed_cache()
+        path = self.cache / "embeddings.npy"
+        original_load = np.load
+        for save in (np.savez, np.savez_compressed):
+            with self.subTest(writer=save.__name__):
+                with path.open("wb") as stream:
+                    save(stream, vectors=np.ones((2, 2), dtype=np.float32))
+                resources = []
+
+                def track_load(*args, **kwargs):
+                    archive = original_load(*args, **kwargs)
+                    self.assertIsInstance(archive, np.lib.npyio.NpzFile)
+                    resources.append((archive, archive.zip, archive.fid))
+                    return archive
+
+                other = self.make_index()
+                with patch.object(np, "load", side_effect=track_load) as load, \
+                        patch.object(np.lib.npyio.NpzFile, "__getitem__",
+                                     side_effect=AssertionError("Archive member accessed")), \
+                        patch.object(ZipFile, "open",
+                                     side_effect=AssertionError("Archive member opened")):
+                    matrix = other._ensure_embeddings()
+                load.assert_called_once_with(path, allow_pickle=False)
+                self.assertEqual(self.document_calls(other), 1)
+                self.assertEqual(matrix.tolist(), [[1.0, 0.0], [0.0, 1.0]])
+                self.assertEqual(len(resources), 1)
+                archive, zip_file, file_handle = resources[0]
+                self.assertIsNone(archive.zip)
+                self.assertIsNone(archive.fid)
+                self.assertIsNone(zip_file.fp)
+                self.assertTrue(file_handle.closed)
+
+    def test_numpy_load_explicitly_disables_pickle(self):
+        self.seed_cache()
+        other = self.make_index()
+        with patch.object(np, "load", wraps=np.load) as load:
+            matrix = other._ensure_embeddings()
+        load.assert_called_once_with(self.cache / "embeddings.npy", allow_pickle=False)
+        self.assertEqual(matrix.tolist(), self.index._embeddings.tolist())
+        self.assertEqual(other._embedding_model.calls, [])
+
+    def test_unreadable_manifest_and_matrix_are_cache_misses(self):
+        self.seed_cache()
+        for target, attribute in ((Path, "read_text"), (np, "load")):
+            with self.subTest(operation=attribute):
+                other = self.make_index()
+                other._ensure_chunks()
+                # Simulate IO failure without permissions changes or guard violations.
+                with patch.object(target, attribute, side_effect=PermissionError("fixture unreadable")):
+                    matrix = other._ensure_embeddings()
+                self.assertEqual(self.document_calls(other), 1)
+                self.assertEqual(matrix.tolist(), [[1.0, 0.0], [0.0, 1.0]])
+
+    def test_cache_manifest_corpus_validation_errors_propagate(self):
+        self.seed_cache()
+        chunks = self.index._chunks
+        with patch.object(np, "load") as load:
+            for error in (ValueError("fixture path outside standards"),
+                          FileNotFoundError("fixture invalid markdown entry")):
+                with self.subTest(error=type(error).__name__), \
+                        patch.object(self.index, "_cache_manifest", side_effect=error):
+                    with self.assertRaises(type(error)) as raised:
+                        self.index._load_cached_embeddings(chunks)
+                    self.assertIs(raised.exception, error)
+            # Exercise actual discovery validation too, without a symlink privilege dependency.
+            (self.corpus / "directory.md").mkdir()
+            with self.assertRaises(FileNotFoundError):
+                self.index._load_cached_embeddings(chunks)
+            load.assert_not_called()
+
+    def test_unexpected_cache_reader_errors_propagate(self):
+        self.seed_cache()
+        for target, attribute in ((Path, "read_text"), (json, "loads"), (np, "load")):
+            for error_type in (TypeError, RuntimeError, MemoryError, KeyboardInterrupt):
+                with self.subTest(operation=attribute, error=error_type.__name__):
+                    error = error_type("synthetic unexpected error")
+                    with patch.object(target, attribute, side_effect=error):
+                        with self.assertRaises(error_type) as raised:
+                            self.index._load_cached_embeddings(self.index._chunks)
+                    self.assertIs(raised.exception, error)
 
 
 class KnownDefectTests(IndexFixture):
@@ -481,48 +697,3 @@ class KnownDefectTests(IndexFixture):
         # Current source contains beta; its freshly encoded vector must be [0, 1].
         self.assertIn("changed synthetic", other._chunks[0].text)
         self.assertEqual(other._embeddings[0].tolist(), [0.0, 1.0])
-
-    @unittest.expectedFailure
-    def test_known_defect_corrupt_npy_is_not_recovered(self):
-        self.seed_cache()
-        (self.cache / "embeddings.npy").write_bytes(b"not a numpy file")
-        other = self.make_index()
-        other.search("alpha", mode="fast")  # Baseline raises ValueError.
-        self.assertEqual(self.document_calls(other), 1)
-        self.assertEqual(other._embeddings.shape, (2, 2))
-
-    @unittest.expectedFailure
-    def test_known_defect_empty_npy_is_not_recovered(self):
-        self.seed_cache()
-        (self.cache / "embeddings.npy").write_bytes(b"")
-        other = self.make_index()
-        other.search("alpha", mode="fast")  # NumPy 2.4.6 raises EOFError.
-        self.assertEqual(self.document_calls(other), 1)
-
-    @unittest.expectedFailure
-    def test_known_defect_rank_one_cache_is_accepted(self):
-        self.seed_cache()
-        np.save(self.cache / "embeddings.npy", np.ones(2, dtype=np.float32))
-        other = self.make_index()
-        matrix = other._ensure_embeddings()
-        self.assertEqual(matrix.ndim, 2)
-        self.assertEqual(self.document_calls(other), 1)
-
-    @unittest.expectedFailure
-    def test_known_defect_rank_zero_cache_is_not_recovered(self):
-        self.seed_cache()
-        np.save(self.cache / "embeddings.npy", np.asarray(1.0, dtype=np.float32))
-        other = self.make_index()
-        matrix = other._ensure_embeddings()  # Baseline raises IndexError.
-        self.assertEqual(matrix.shape, (2, 2))
-        self.assertEqual(self.document_calls(other), 1)
-
-    @unittest.expectedFailure
-    def test_known_defect_nonfinite_cache_is_accepted(self):
-        self.seed_cache()
-        np.save(self.cache / "embeddings.npy",
-                np.asarray([[np.nan, 0.0], [np.inf, 1.0]], dtype=np.float32))
-        other = self.make_index()
-        matrix = other._ensure_embeddings()
-        self.assertTrue(np.isfinite(matrix).all())
-        self.assertEqual(self.document_calls(other), 1)

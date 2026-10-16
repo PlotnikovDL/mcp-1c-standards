@@ -18,17 +18,10 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HEAVY_MODULES = {"sentence_transformers", "torch", "transformers", "huggingface_hub"}
 CORE_FILES = ("server.py", "standards_index.py", "requirements.txt")
-EXPECTED_DEFECT_ERRORS = {
-    "test_known_defect_corrupt_npy_is_not_recovered": "ValueError",
-    "test_known_defect_empty_npy_is_not_recovered": "EOFError",
-    "test_known_defect_rank_zero_cache_is_not_recovered": "IndexError",
-    **dict.fromkeys((
-        "test_known_defect_warm_index_does_not_refresh_changed_source",
-        "test_known_defect_source_mutation_during_encode_stamps_stale_vectors_current",
-        "test_known_defect_rank_one_cache_is_accepted",
-        "test_known_defect_nonfinite_cache_is_accepted",
-    ), "AssertionError"),
-}
+EXPECTED_DEFECT_ERRORS = dict.fromkeys((
+    "test_known_defect_warm_index_does_not_refresh_changed_source",
+    "test_known_defect_source_mutation_during_encode_stamps_stale_vectors_current",
+), "AssertionError")
 
 
 class BlockedOperation(RuntimeError):

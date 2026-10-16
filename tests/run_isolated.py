@@ -18,6 +18,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HEAVY_MODULES = {"sentence_transformers", "torch", "transformers", "huggingface_hub"}
 CORE_FILES = ("server.py", "standards_index.py", "requirements.txt")
+# Real data stored inside the repository root. The root itself stays readable for
+# module imports, but tests must never open or list the real corpus or cache.
+DENIED_ROOTS = (ROOT / "corpus", ROOT / ".cache")
 EXPECTED_DEFECT_ERRORS = {
     "test_known_limitation_same_size_mtime_content_change_is_not_detected": "AssertionError",
 }
@@ -38,9 +41,10 @@ class CheckedResult(unittest.TextTestResult):
 
 
 class TestGuard(importlib.abc.MetaPathFinder):
-    def __init__(self, temporary_root: Path, read_roots: list[Path]):
+    def __init__(self, temporary_root: Path, read_roots: list[Path], denied_roots=DENIED_ROOTS):
         self.temporary_root = temporary_root.resolve()
         self.read_roots = [p.resolve() for p in read_roots]
+        self.denied_roots = [p.resolve() for p in denied_roots]
         self.violations: list[str] = []
 
     def deny(self, operation: str):
@@ -59,6 +63,9 @@ class TestGuard(importlib.abc.MetaPathFinder):
         if os.fsdecode(value).lower() == os.devnull.lower():
             return
         path = Path(os.fsdecode(value)).resolve()
+        # Denied roots are checked before allowed roots: ROOT is allowed broadly.
+        if any(path.is_relative_to(root) for root in self.denied_roots):
+            self.deny("filesystem access to real repository corpus/cache")
         roots = [self.temporary_root] if write else self.read_roots
         if not any(path.is_relative_to(root) for root in roots):
             self.deny("filesystem write outside fixtures" if write else "filesystem read outside allowed roots")
@@ -90,6 +97,9 @@ class TestGuard(importlib.abc.MetaPathFinder):
             lambda: sys.audit("socket.__new__", None, 2, 1, 0),
             lambda: sys.audit("open", str(ROOT / "must-not-be-created"), "w", os.O_CREAT),
             lambda: self.find_spec("sentence_transformers"),
+            # Synthetic events only: the real corpus and cache are never opened.
+            lambda: sys.audit("open", str(ROOT / "corpus" / "standards" / "std411.md"), "r", os.O_RDONLY),
+            lambda: sys.audit("os.scandir", str(ROOT / ".cache")),
         ]
         for check in checks:
             before = len(self.violations)
@@ -101,7 +111,7 @@ class TestGuard(importlib.abc.MetaPathFinder):
                 self.violations.pop()  # Only this intentionally generated violation.
             else:
                 raise RuntimeError("Guard self-check did not block the operation")
-        print("GUARD_SELF_CHECKS=4/4")
+        print(f"GUARD_SELF_CHECKS={len(checks)}/{len(checks)}")
 
 
 def verify_exception_capture():

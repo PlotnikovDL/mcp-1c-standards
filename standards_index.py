@@ -31,8 +31,9 @@ if TYPE_CHECKING:
     from sentence_transformers import CrossEncoder, SentenceTransformer
 
 
-DEFAULT_STANDARDS_DIR = Path(r"C:\projects\1c-tools\1c-docs\standards")
-DEFAULT_CACHE_DIR = Path(r"C:\projects\1c-tools\mcp-1c-standards\.cache")
+# The corpus is stored in this repository; defaults are relative to this module.
+DEFAULT_STANDARDS_DIR = Path(__file__).resolve().parent / "corpus" / "standards"
+DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 DEFAULT_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 DEFAULT_QUERY_INSTRUCTION = (

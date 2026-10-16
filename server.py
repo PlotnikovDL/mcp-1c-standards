@@ -42,7 +42,7 @@ mcp = FastMCP(
     name="mcp-1c-standards",
     instructions=(
         "Семантический поиск по стандартам разработки 1С через Qwen3 Embedding и Qwen3 Reranker. "
-        "Источник стандартов: C:\\projects\\1c-tools\\1c-docs\\standards."
+        "Источник стандартов: каталог corpus\\standards в репозитории сервера."
     ),
 )
 

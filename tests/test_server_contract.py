@@ -126,6 +126,19 @@ class ServerContractTests(unittest.TestCase):
         self.assertEqual(kwargs["name"], "mcp-1c-standards")
         self.assertIsInstance(kwargs["instructions"], str)
 
+    def test_default_corpus_and_cache_are_repository_relative(self):
+        expected = {
+            "DEFAULT_STANDARDS_DIR": "Path(__file__).resolve().parent / 'corpus' / 'standards'",
+            "DEFAULT_CACHE_DIR": "Path(__file__).resolve().parent / '.cache'",
+        }
+        for name, source in expected.items():
+            self.assertEqual(ast.unparse(self.assignment(self.index, name)), source)
+        for tree in (self.server, self.index):
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    self.assertNotIn("1c-docs", node.value)
+                    self.assertNotRegex(node.value, r"(?i)^[a-z]:[\\/]")
+
     def test_search_mode_schema_and_model_constants(self):
         self.assertEqual(ast.literal_eval(self.assignment(self.index, "SEARCH_MODES")), {
             "fast": {"candidate_limit": 12, "use_reranker": False},

@@ -197,6 +197,38 @@ class ReadListTests(IndexFixture):
         self.assertIsNone(index._reranker_model)
 
 
+class DefaultPathTests(unittest.TestCase):
+    """Defaults point inside the repository; tests never touch the real corpus."""
+
+    def test_from_env_defaults_point_inside_repository_without_access(self):
+        import standards_index
+
+        repository = Path(standards_index.__file__).resolve().parent
+        self.assertEqual(standards_index.DEFAULT_STANDARDS_DIR, repository / "corpus" / "standards")
+        self.assertEqual(standards_index.DEFAULT_CACHE_DIR, repository / ".cache")
+        with patch.dict(os.environ):
+            os.environ.pop("ONEC_STANDARDS_DIR", None)
+            os.environ.pop("ONEC_STANDARDS_CACHE_DIR", None)
+            # Construction only: the guard rejects any open/list of corpus/cache.
+            index = StandardsIndex.from_env()
+        self.assertEqual(index.standards_dir, repository / "corpus" / "standards")
+        self.assertEqual(index.cache_dir, repository / ".cache")
+        self.assertIsNone(index._chunks)
+        self.assertIsNone(index._embeddings)
+        self.assertIsNone(index._embedding_model)
+        self.assertIsNone(index._reranker_model)
+
+    def test_runner_environment_substitutes_temporary_default_corpus(self):
+        import standards_index
+
+        temporary_root = Path(os.environ["MCP_STANDARDS_TEST_ROOT"]).resolve()
+        index = StandardsIndex.from_env()
+        self.assertEqual(index.standards_dir.resolve(), temporary_root / "default-corpus")
+        self.assertEqual(index.cache_dir.resolve(), temporary_root / "default-cache")
+        self.assertFalse(index.standards_dir.resolve().is_relative_to(
+            standards_index.DEFAULT_STANDARDS_DIR.parent))
+
+
 class SearchTests(IndexFixture):
     def test_search_rejects_outside_symlink(self):
         self.external_symlink()

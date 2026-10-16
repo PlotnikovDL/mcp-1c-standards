@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import Any
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -20,9 +22,21 @@ for logger_name in (
 ):
     logging.getLogger(logger_name).setLevel(logging.ERROR)
 
-from mcp.server.fastmcp import FastMCP
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp-shared-runtime"))
 
-from standards_index import StandardsIndex
+from shared_runtime import SharedIndexProxy, run_worker_if_requested
+
+SPEC = dict(
+    name="1c-standards",
+    module="standards_index",
+    class_name="StandardsIndex",
+    methods=("search", "read_standard", "list_standards"),
+    env_prefix="ONEC_STANDARDS_",
+)
+
+run_worker_if_requested(__file__, **SPEC)
+
+from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     name="mcp-1c-standards",
@@ -32,7 +46,7 @@ mcp = FastMCP(
     ),
 )
 
-index = StandardsIndex.from_env()
+index = SharedIndexProxy(__file__, **SPEC)
 
 
 @mcp.tool()

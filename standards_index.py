@@ -7,7 +7,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -25,7 +25,9 @@ for logger_name in (
     logging.getLogger(logger_name).setLevel(logging.ERROR)
 
 import numpy as np
-from sentence_transformers import CrossEncoder, SentenceTransformer
+
+if TYPE_CHECKING:
+    from sentence_transformers import CrossEncoder, SentenceTransformer
 
 
 DEFAULT_STANDARDS_DIR = Path(r"C:\projects\1c-tools\1c-docs\standards")
@@ -318,12 +320,16 @@ class StandardsIndex:
 
     def _get_embedding_model(self) -> SentenceTransformer:
         if self._embedding_model is None:
+            from sentence_transformers import SentenceTransformer
+
             with quiet_model_output():
                 self._embedding_model = SentenceTransformer(self.embedding_model_name, device="cpu")
         return self._embedding_model
 
     def _get_reranker_model(self) -> CrossEncoder:
         if self._reranker_model is None:
+            from sentence_transformers import CrossEncoder
+
             prompt = {"1c_standards": self.query_instruction}
             try:
                 with quiet_model_output():

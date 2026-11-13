@@ -227,9 +227,9 @@ class StandardsIndex:
         pairs = [(query, self._reranker_text(chunks[int(index)])) for index in candidate_indexes]
         with quiet_model_output():
             try:
-                scores = self._get_reranker_model().predict(pairs, show_progress_bar=False)
+                scores = self._get_reranker_model().predict(pairs, batch_size=1, show_progress_bar=False)
             except TypeError:
-                scores = self._get_reranker_model().predict(pairs)
+                scores = self._get_reranker_model().predict(pairs, batch_size=1)
 
         self._verify_snapshot(snapshot)
         ranked = [
@@ -420,7 +420,9 @@ class StandardsIndex:
             from sentence_transformers import SentenceTransformer
 
             with quiet_model_output():
-                self._embedding_model = SentenceTransformer(self.embedding_model_name, device="cpu")
+                self._embedding_model = SentenceTransformer(
+                    self.embedding_model_name, device="cpu", model_kwargs={"dtype": "float32"}
+                )
         return self._embedding_model
 
     def _get_reranker_model(self) -> CrossEncoder:
@@ -433,12 +435,15 @@ class StandardsIndex:
                     self._reranker_model = CrossEncoder(
                         self.reranker_model_name,
                         device="cpu",
+                        model_kwargs={"dtype": "float32"},
                         prompts=prompt,
                         default_prompt_name="1c_standards",
                     )
             except TypeError:
                 with quiet_model_output():
-                    self._reranker_model = CrossEncoder(self.reranker_model_name, device="cpu")
+                    self._reranker_model = CrossEncoder(
+                        self.reranker_model_name, device="cpu", model_kwargs={"dtype": "float32"}
+                    )
         return self._reranker_model
 
     def _query_prompt(self) -> str:

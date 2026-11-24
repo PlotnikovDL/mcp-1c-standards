@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,6 @@ for logger_name in (
 ):
     logging.getLogger(logger_name).setLevel(logging.ERROR)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mcp-shared-runtime"))
-
-from shared_runtime import SharedIndexProxy, run_worker_if_requested
-
 SPEC = dict(
     name="1c-standards",
     module="standards_index",
@@ -34,7 +31,20 @@ SPEC = dict(
     env_prefix="ONEC_STANDARDS_",
 )
 
-run_worker_if_requested(__file__, **SPEC)
+RUNTIME_DIR = Path(__file__).resolve().parent.parent / "mcp-shared-runtime"
+USE_SHARED_RUNTIME = (
+    os.environ.get("ONEC_STANDARDS_STANDALONE") != "1"
+    and (RUNTIME_DIR / "shared_runtime.py").is_file()
+)
+
+if USE_SHARED_RUNTIME:
+    sys.path.insert(0, str(RUNTIME_DIR))
+    from shared_runtime import SharedIndexProxy, run_worker_if_requested
+
+    run_worker_if_requested(__file__, **SPEC)
+    index = SharedIndexProxy(__file__, **SPEC)
+elif "--shared-worker" in sys.argv[1:]:
+    raise SystemExit("--shared-worker requires the sibling mcp-shared-runtime in shared mode.")
 
 from mcp.server.fastmcp import FastMCP
 
@@ -46,7 +56,15 @@ mcp = FastMCP(
     ),
 )
 
-index = SharedIndexProxy(__file__, **SPEC)
+
+@cache
+def _get_index():
+    if USE_SHARED_RUNTIME:
+        return index
+
+    from standards_index import StandardsIndex
+
+    return StandardsIndex.from_env()
 
 
 @mcp.tool()
@@ -58,7 +76,7 @@ def search_standards(
     use_reranker: bool | None = None,
 ) -> dict[str, Any]:
     """Найти стандарты 1С. mode: fast, normal или deep. candidate_limit/use_reranker - ручные override."""
-    return index.search(
+    return _get_index().search(
         query=query,
         limit=limit,
         mode=mode,
@@ -70,14 +88,20 @@ def search_standards(
 @mcp.tool()
 def read_standard(path: str) -> dict[str, str]:
     """Прочитать markdown-файл стандарта по имени файла или полному пути."""
-    return index.read_standard(path)
+    return _get_index().read_standard(path)
 
 
 @mcp.tool()
 def list_standards() -> list[dict[str, Any]]:
     """Показать список доступных markdown-стандартов."""
-    return index.list_standards()
+    return _get_index().list_standards()
 
 
 if __name__ == "__main__":
+    if os.name == "nt" and not USE_SHARED_RUNTIME:
+        # Keep the SDK pipe on a separate descriptor. Native libraries can
+        # block on fd 0 while the SDK is already waiting for its next request.
+        sys.stdin = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8")
+        with open(os.devnull, "rb") as native_stdin:
+            os.dup2(native_stdin.fileno(), 0)
     mcp.run(transport="stdio")

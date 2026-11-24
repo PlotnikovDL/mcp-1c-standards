@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import ast
-import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
 import unittest
 
 
@@ -13,12 +11,6 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
 class ServerContractTests(unittest.TestCase):
     def setUp(self):
-        self.temp = TemporaryDirectory(dir=os.environ["MCP_STANDARDS_TEST_ROOT"])
-        self.addCleanup(self.temp.cleanup)
-        self.corpus = Path(self.temp.name) / "corpus"
-        self.cache = Path(self.temp.name) / "cache"
-        self.corpus.mkdir()
-        self.cache.mkdir()
         self.server = ast.parse((SOURCE_ROOT / "server.py").read_text(encoding="utf-8"))
         self.index = ast.parse((SOURCE_ROOT / "standards_index.py").read_text(encoding="utf-8"))
 
@@ -78,7 +70,7 @@ class ServerContractTests(unittest.TestCase):
 
     def test_search_forwards_every_argument_unchanged(self):
         call = self.forwarded_call(self.functions()["search_standards"])
-        self.assertEqual(ast.unparse(call.func), "index.search")
+        self.assertEqual(ast.unparse(call.func), "_get_index().search")
         self.assertEqual(call.args, [])
         names = ["query", "limit", "mode", "candidate_limit", "use_reranker"]
         self.assertEqual([(keyword.arg, ast.unparse(keyword.value)) for keyword in call.keywords],
@@ -87,11 +79,11 @@ class ServerContractTests(unittest.TestCase):
     def test_read_and_list_forward_unchanged(self):
         functions = self.functions()
         read = self.forwarded_call(functions["read_standard"])
-        self.assertEqual(ast.unparse(read.func), "index.read_standard")
+        self.assertEqual(ast.unparse(read.func), "_get_index().read_standard")
         self.assertEqual([ast.unparse(value) for value in read.args], ["path"])
         self.assertEqual(read.keywords, [])
         listing = self.forwarded_call(functions["list_standards"])
-        self.assertEqual(ast.unparse(listing.func), "index.list_standards")
+        self.assertEqual(ast.unparse(listing.func), "_get_index().list_standards")
         self.assertEqual(listing.args, [])
         self.assertEqual(listing.keywords, [])
 
@@ -107,19 +99,47 @@ class ServerContractTests(unittest.TestCase):
             ("env_prefix", "ONEC_STANDARDS_"),
         ])
 
-    def test_proxy_worker_and_stdio_wiring_is_static(self):
-        proxy = self.assignment(self.server, "index")
-        self.assertEqual(ast.unparse(proxy), "SharedIndexProxy(__file__, **SPEC)")
-        worker_calls = [node.value for node in self.server.body if isinstance(node, ast.Expr)
-                        and isinstance(node.value, ast.Call)
-                        and ast.unparse(node.value.func) == "run_worker_if_requested"]
-        self.assertEqual([ast.unparse(node) for node in worker_calls],
-                         ["run_worker_if_requested(__file__, **SPEC)"])
+    def test_shared_worker_uses_sibling_when_available(self):
+        self.assertEqual(ast.unparse(self.assignment(self.server, "RUNTIME_DIR")),
+                         "Path(__file__).resolve().parent.parent / 'mcp-shared-runtime'")
+        self.assertEqual(ast.unparse(self.assignment(self.server, "USE_SHARED_RUNTIME")),
+                         "os.environ.get('ONEC_STANDARDS_STANDALONE') != '1' and "
+                         "(RUNTIME_DIR / 'shared_runtime.py').is_file()")
+        shared = next(node for node in self.server.body if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "USE_SHARED_RUNTIME")
+        self.assertEqual([ast.unparse(node) for node in shared.body], [
+            "sys.path.insert(0, str(RUNTIME_DIR))",
+            "from shared_runtime import SharedIndexProxy, run_worker_if_requested",
+            "run_worker_if_requested(__file__, **SPEC)",
+            "index = SharedIndexProxy(__file__, **SPEC)",
+        ])
+        worker_guard, = shared.orelse
+        self.assertEqual(ast.unparse(worker_guard.test), "'--shared-worker' in sys.argv[1:]")
+        self.assertIsInstance(worker_guard.body[0], ast.Raise)
+        self.assertLess(shared.lineno, self.assignment(self.server, "mcp").lineno)
+
+    def test_standalone_index_is_lazy_and_reused(self):
+        factory = self.functions()["_get_index"]
+        self.assertEqual([ast.unparse(node) for node in factory.decorator_list], ["cache"])
+        mode, local_import, create = factory.body
+        self.assertEqual(ast.unparse(mode.test), "USE_SHARED_RUNTIME")
+        self.assertEqual(ast.unparse(mode.body[0]), "return index")
+        self.assertEqual(ast.unparse(local_import), "from standards_index import StandardsIndex")
+        self.assertEqual(ast.unparse(create), "return StandardsIndex.from_env()")
+
+    def test_stdio_and_registration_wiring_is_static(self):
         main_guards = [node for node in self.server.body if isinstance(node, ast.If)
                        and ast.unparse(node.test) == "__name__ == '__main__'"]
         self.assertEqual(len(main_guards), 1)
-        self.assertEqual([ast.unparse(node) for node in main_guards[0].body],
-                         ["mcp.run(transport='stdio')"])
+        windows_stdin, run = main_guards[0].body
+        self.assertEqual(ast.dump(windows_stdin.test),
+                         ast.dump(ast.parse("os.name == 'nt' and not USE_SHARED_RUNTIME", mode="eval").body))
+        duplicate, redirect = windows_stdin.body
+        self.assertEqual(ast.unparse(duplicate),
+                         "sys.stdin = os.fdopen(os.dup(sys.stdin.fileno()), 'r', encoding='utf-8')")
+        self.assertEqual(ast.unparse(redirect.items[0].context_expr), "open(os.devnull, 'rb')")
+        self.assertEqual(ast.unparse(redirect.body[0]), "os.dup2(native_stdin.fileno(), 0)")
+        self.assertEqual(ast.unparse(run), "mcp.run(transport='stdio')")
         mcp = self.assignment(self.server, "mcp")
         self.assertEqual(ast.unparse(mcp.func), "FastMCP")
         kwargs = {keyword.arg: ast.literal_eval(keyword.value) for keyword in mcp.keywords}

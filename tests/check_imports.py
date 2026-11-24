@@ -18,6 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_TOOLS = {"search_standards", "read_standard", "list_standards"}
 
 
+def check_registration(server):
+    assert server.mcp.name == "mcp-1c-standards"
+    registered = {tool.name for tool in server.mcp._tool_manager.list_tools()}
+    assert registered == EXPECTED_TOOLS
+
+
 def main():
     if len(sys.argv) != 1 or sys.flags.optimize or not (sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode):
         print("Use the selected venv Python with -I -S -B tests/check_imports.py; no -O or extra arguments.")
@@ -34,9 +40,7 @@ def main():
         print("Selected site-packages directory is absent; nothing was installed.")
         return 3
     runtime_root = ROOT.parent / "mcp-shared-runtime"
-    if not (runtime_root / "shared_runtime.py").is_file():
-        print("The isolated sibling runtime worktree is absent; production runtime will not be substituted.")
-        return 3
+    has_shared_runtime = (runtime_root / "shared_runtime.py").is_file()
     sys.path.insert(0, str(ROOT / "tests"))
     # Definitions only: importing the runner does not invoke its main function.
     from run_isolated import HEAVY_MODULES, TestGuard, configure_environment, fingerprints
@@ -68,27 +72,42 @@ def main():
             sys.path[0:0] = [str(ROOT), str(site_packages), *(str(path) for path in win32_paths)]
             # SDK dotenv lookup is confined to the owned empty temporary cwd.
             # No .pth/bootstrap scripts, workers, event loops or tool calls.
-            index_module = importlib.import_module("standards_index")
+            if has_shared_runtime:
+                os.environ["ONEC_STANDARDS_STANDALONE"] = "1"
             server_module = importlib.import_module("server")
-            runtime_module = sys.modules["shared_runtime"]
+            assert not server_module.USE_SHARED_RUNTIME
+            check_registration(server_module)
+            assert "standards_index" not in sys.modules
+            assert "shared_runtime" not in sys.modules
+            local_index = server_module._get_index()
+            index_module = sys.modules["standards_index"]
+            assert type(local_index) is index_module.StandardsIndex
+            assert server_module._get_index() is local_index
+            assert local_index.standards_dir == temporary_root / "default-corpus"
+            assert local_index.cache_dir == temporary_root / "default-cache"
+            assert local_index._embedding_model is None and local_index._reranker_model is None
+            if has_shared_runtime:
+                del os.environ["ONEC_STANDARDS_STANDALONE"]
+                server_module = importlib.reload(server_module)
+                assert server_module.USE_SHARED_RUNTIME
+                check_registration(server_module)
+                runtime_module = sys.modules["shared_runtime"]
+                assert Path(runtime_module.__file__).resolve() == runtime_root / "shared_runtime.py"
+                proxy = server_module._get_index()
+                assert proxy is server_module.index
+                assert proxy.entrypoint == ROOT / "server.py"
+                assert proxy.runtime_dir.is_relative_to(temporary_root)
+                assert not proxy.runtime_dir.exists()
             sdk_module = sys.modules["mcp"]
             numpy_module = sys.modules["numpy"]
             assert Path(index_module.__file__).resolve() == ROOT / "standards_index.py"
             assert Path(server_module.__file__).resolve() == ROOT / "server.py"
-            assert Path(runtime_module.__file__).resolve() == runtime_root / "shared_runtime.py"
             assert Path(sdk_module.__file__).resolve().is_relative_to(site_packages.resolve())
             assert Path(numpy_module.__file__).resolve().is_relative_to(site_packages.resolve())
             for name in ("pywintypes", "win32api", "win32con", "win32job"):
                 assert Path(sys.modules[name].__file__).resolve().is_relative_to(site_packages.resolve())
             assert "pywin32_bootstrap" not in sys.modules
             assert not (temporary_root / ".env").exists()
-            assert server_module.mcp.name == "mcp-1c-standards"
-            # Inspect only already registered local metadata, not async tools/list.
-            registered = {tool.name for tool in server_module.mcp._tool_manager.list_tools()}
-            assert registered == EXPECTED_TOOLS
-            assert server_module.index.entrypoint == ROOT / "server.py"
-            assert server_module.index.runtime_dir.is_relative_to(temporary_root)
-            assert not server_module.index.runtime_dir.exists()
             assert not list((temporary_root / "default-corpus").iterdir())
             assert not list((temporary_root / "default-cache").iterdir())
             assert not (temporary_root / "models").exists()
@@ -103,7 +122,9 @@ def main():
             print("NUMPY_VERSION=", numpy_module.__version__)
             print("ISOLATED_MODULE_PATHS_VERIFIED=True")
             print("INDEX_AND_SERVER_IMPORTS_VERIFIED=True")
-            print("LOCAL_REGISTERED_TOOLS=", sorted(registered))
+            print("STANDALONE_IMPORT_VERIFIED=True")
+            print("SHARED_IMPORT_VERIFIED=", has_shared_runtime)
+            print("LOCAL_REGISTERED_TOOLS=", sorted(EXPECTED_TOOLS))
             print("WORKER_STATE_CREATED=False")
             print("MODELS_IMPORTED_OR_CREATED=False")
             print("CORE_SOURCE_BYTES_UNCHANGED=True")

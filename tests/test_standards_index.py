@@ -731,7 +731,7 @@ class FreshnessTests(IndexFixture):
         self.assertIn("changed synthetic", alpha["excerpt"])
         self.assertEqual(index._embeddings[0].tolist(), [0.0, 1.0])
 
-    def test_known_defect_warm_index_does_not_refresh_changed_source(self):
+    def test_warm_index_refreshes_changed_source(self):
         self.seed_cache()
         models = self.index._embedding_model, self.index._reranker_model
         chunks, vectors = self.index._chunks, self.index._embeddings
@@ -747,7 +747,7 @@ class FreshnessTests(IndexFixture):
         self.assertTrue(any("changed synthetic" in text for _, text in pairs))
         self.assertFalse(any("original body" in text for _, text in pairs))
 
-    def test_known_defect_source_mutation_during_encode_stamps_stale_vectors_current(self):
+    def test_source_mutation_during_encode_rejects_stale_vectors(self):
         model = FakeEmbedding(on_documents=self.mutate_alpha)
         self.index._embedding_model = model
         with self.assertRaisesRegex(RuntimeError, "changed.*repeat"):
